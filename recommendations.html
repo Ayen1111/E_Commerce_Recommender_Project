@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Recommendations</title>
+<style>
+:root{--bg:#0b0d10;--card:#15171a;--accent:#2ea3ff;--muted:#93a3b8;--text:#e6eef6}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;justify-content:space-between;align-items:center;padding:16px;border-bottom:1px solid #111}
+header .title{font-weight:800;font-size:20px}
+button.ghost{background:transparent;border:1px solid #2a2e33;color:var(--muted);border-radius:10px;padding:8px 12px;cursor:pointer}
+button.ghost:hover{border-color:#3b4857;color:#c7d6e8}
+.controls{display:flex;gap:12px;align-items:center;margin:16px;padding:10px 12px;border:1px solid #111;border-radius:12px;background:#0f1115}
+.controls label{color:var(--muted);font-size:14px}
+.controls input[type=range]{width:220px}
+.controls input[type=number]{width:80px;padding:6px 8px;border-radius:8px;border:1px solid #222;background:#15171a;color:var(--text)}
+button.primary{padding:8px 14px;border-radius:10px;border:1px solid #7aa9d1;background:var(--accent);color:#02243a;font-weight:700;cursor:pointer}
+button.primary:hover{background:#47afff}
+.badges{display:flex;gap:10px;flex-wrap:wrap;margin:0 16px 8px}
+.badge{font-size:12px;color:#cdd9e5;background:#11161b;border:1px solid #1b2330;border-radius:999px;padding:4px 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:12px}
+.card{background:var(--card);border:1px solid #111;border-radius:10px;overflow:hidden}
+.card-img{width:100%;height:150px;object-fit:cover;background:#111}
+.meta{padding:10px}
+.title{font-weight:700;font-size:14px}
+.brand{color:var(--muted);font-size:13px}
+.price{color:var(--accent);font-weight:800}
+.reason{color:#8ea7bf;font-size:12px;margin-top:6px;line-height:1.3}
+#loader{padding:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title">✨ Recommended for You</div>
+  <button class="ghost" onclick="history.back()">← Back</button>
+</header>
+
+<div class="badges" id="seedInfo"></div>
+
+<div class="controls">
+  <label for="lambda2" title="0 = more diverse, 1 = more similar">Serendipity:</label>
+  <input id="lambda2" type="range" min="0" max="1" step="0.05" value="0.8">
+  <span id="lambda2Val">0.80</span>
+
+  <label for="topk2" style="margin-left:8px">Top K:</label>
+  <input id="topk2" type="number" value="12" min="1" max="50">
+
+  <!-- ✅ New: price band -->
+  <label for="minP" style="margin-left:8px">Price ₹:</label>
+  <input id="minP" type="number" placeholder="min" min="0" style="width:90px">
+  <span>–</span>
+  <input id="maxP" type="number" placeholder="max" min="0" style="width:90px">
+
+  <button id="rerankBtn" type="button" class="primary">Re-rank</button>
+</div>
+
+<div id="loader">Loading…</div>
+<div id="recGrid" class="grid"></div>
+
+<script>
+/* ---------- DOM refs ---------- */
+const recGrid = document.getElementById('recGrid');
+const loader  = document.getElementById('loader');
+const seedInfo = document.getElementById('seedInfo');
+const lambda2 = document.getElementById('lambda2');
+const lambda2Val = document.getElementById('lambda2Val');
+const minPInput = document.getElementById('minP');
+const maxPInput = document.getElementById('maxP');
+const topk2 = document.getElementById('topk2');
+const rerankBtn = document.getElementById('rerankBtn');
+lambda2.oninput = ()=> lambda2Val.textContent = Number(lambda2.value).toFixed(2);
+
+/* ---------- utils ---------- */
+function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function toNum(x){ const n=parseFloat(String(x||'').replace(/[^\d.]/g,'')); return isFinite(n)?n:0; }
+
+// ---------- Price Range Filter Helper ----------
+function filterByPrice(items, lo, hi) {
+  const minv = Number.isFinite(lo) ? lo : 0;
+  const maxv = Number.isFinite(hi) ? hi : Infinity;
+  return items.filter(p => {
+    const price = parseFloat(String(p.price || 0).toString().replace(/[^\d.]/g, '')) || 0;
+    return price >= minv && price <= maxv;
+  });
+}
+
+
+/* robust CSV */
+function parseAndCleanCSV(txt){
+  const lines = txt.replace(/^\uFEFF/,'').split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return [];
+  const headers = splitCols(lines.shift()).map(h=>h.trim().toLowerCase());
+  const out=[];
+  for(const line of lines){
+    const cols = splitCols(line);
+    const o={};
+    headers.forEach((h,i)=>o[h]=(cols[i]??'').trim());
+    o.product_name = o.product_name || o['product name'] || o.title || o.name || 'Unnamed Product';
+    o.product_category_tree = o.product_category_tree || o.category || o['product category'] || o['category name'] || '';
+    o.brand = o.brand || o.brand_name || o['brand name'] || o.manufacturer || '';
+    const p = (o.discounted_price || o.price || '').toString().replace(/[^\d.]/g,'');
+    o.price = isFinite(parseFloat(p)) ? parseFloat(p) : 0;
+    let img = o.image || o.image_url || o['image url'] || '';
+    if(!/^https?:\/\//i.test(img)){
+      img = `https://via.placeholder.com/400x300/1b1f24/ffffff?text=${encodeURIComponent((o.product_name||'Item').slice(0,40))}`;
+    }
+    o.image = img;
+    out.push(o);
+  }
+  return out;
+  function splitCols(line){
+    const a=[]; let cur='',q=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){ q=!q; cur+=ch; continue; }
+      if(ch===',' && !q){ a.push(trimQ(cur)); cur=''; continue; }
+      cur+=ch;
+    }
+    a.push(trimQ(cur));
+    return a;
+  }
+  function trimQ(s){ return s.replace(/^"+|"+$/g,''); }
+}
+
+/* text → tokens + TF-IDF + MMR */
+function tokenize(s){
+  s=(s||'').toLowerCase();
+  const toks=s.replace(/[^a-z0-9\s]+/g,' ').split(/\s+/).filter(t=>t.length>1);
+  const stop=new Set(['the','and','for','with','from','your','you','this','that','have','has','are','was','were','of','in','on','to','a','an']);
+  return toks.filter(t=>!stop.has(t));
+}
+function l2(v){ let s=0; for(const w of v.values()) s+=w*w; return Math.sqrt(s)||0; }
+function cosine(a,aN,b,bN){
+  if(!aN||!bN) return 0;
+  let dot=0; const [small,big]=a.size<b.size?[a,b]:[b,a];
+  for(const [t,w] of small){ const ww=big.get(t); if(ww) dot+=w*ww; }
+  return dot/(aN*bN);
+}
+function buildIdfAndVecs(items){
+  const df=new Map(), toksArr=new Array(items.length);
+  for(let i=0;i<items.length;i++){
+    const p=items[i];
+    const toks=[...tokenize(p.product_name),...tokenize(p.product_category_tree),...tokenize(p.brand),...tokenize(p.description)];
+    toksArr[i]=toks; const uniq=new Set(toks);
+    for(const t of uniq){ df.set(t,(df.get(t)||0)+1); }
+  }
+  const N=items.length, idf=new Map();
+  for(const [t,d] of df){ idf.set(t, Math.log((N+1)/(d+1))+1); }
+  const vecs=new Array(N), norms=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const v=new Map();
+    for(const t of toksArr[i]){ const w=idf.get(t); if(!w) continue; v.set(t,(v.get(t)||0)+w); }
+    vecs[i]=v; norms[i]=l2(v);
+  }
+  return {idf,vecs,norms};
+}
+function vecFromSeed(seed,idf){
+  const toks=[...tokenize(seed.product_name),...tokenize(seed.product_category_tree),...tokenize(seed.brand),...tokenize(seed.description)];
+  const v=new Map(); for(const t of toks){ const w=idf.get(t); if(!w) continue; v.set(t,(v.get(t)||0)+w); }
+  return {v, n:l2(v)||1e-8};
+}
+function mmrRank(items, seedObjs, lambda=0.8, k=12){
+  if(!items.length) return [];
+  const {idf,vecs,norms} = buildIdfAndVecs(items);
+
+  // centroid over saved seed objects (fallback to first few items if none)
+  let cent=new Map(), centN=0;
+  if(seedObjs && seedObjs.length){
+    for(const s of seedObjs){
+      const {v} = vecFromSeed(s,idf);
+      for(const [t,w] of v){ cent.set(t,(cent.get(t)||0)+w); }
+    }
+    centN = l2(cent)||1e-8;
+  } else {
+    // no seeds: centroid of first 10 items for stable ordering
+    for(let i=0;i<Math.min(10,items.length);i++){
+      for(const [t,w] of vecs[i]){ cent.set(t,(cent.get(t)||0)+w); }
+    }
+    centN = l2(cent)||1e-8;
+  }
+
+  const base = new Float32Array(items.length);
+  for(let i=0;i<items.length;i++){ base[i] = cosine(cent,centN,vecs[i],norms[i]); }
+
+  const order = Array.from({length:items.length},(_,i)=>i).sort((a,b)=>base[b]-base[a]);
+  const chosenIdx=[], chosenVecs=[], chosenNorms=[];
+  const L = Math.max(1, Math.min(50, parseInt(k)||12));
+  for(let pick=0; pick<L && order.length; pick++){
+    let best=-1,bestScore=-1;
+    if(pick===0){ best=order[0]; }
+    else{
+      for(const i of order){
+        let maxSim=0;
+        for(let j=0;j<chosenVecs.length;j++){
+          const sim=cosine(chosenVecs[j],chosenNorms[j],vecs[i],norms[i]);
+          if(sim>maxSim) maxSim=sim;
+        }
+        const mmr = lambda*base[i] - (1-lambda)*maxSim;
+        if(mmr>bestScore){ bestScore=mmr; best=i; }
+      }
+    }
+    if(best<0) break;
+    chosenIdx.push(best);
+    chosenVecs.push(vecs[best]); chosenNorms.push(norms[best]);
+    order.splice(order.indexOf(best),1);
+  }
+  return chosenIdx.map(i=>items[i]);
+}
+
+/* ---------- render ---------- */
+function render(list, seeds){
+  loader.style.display='none';
+  recGrid.innerHTML='';
+  const topK = Math.max(1, Math.min(50, parseInt(topk2.value)||12));
+  list.slice(0,topK).forEach(p=>{
+    const card=document.createElement('div');
+    card.className='card';
+    const reason = [
+      seeds?.length ? `similar to your picks` : '',
+      p.product_category_tree ? `category: ${p.product_category_tree}` : '',
+      p.brand ? `brand: ${p.brand}` : '',
+      p.price ? `price ₹${Number(toNum(p.price)).toLocaleString()}` : ''
+    ].filter(Boolean).join(' • ');
+    card.innerHTML=`
+      <img class="card-img" src="${p.image}" alt="${escapeHtml(p.product_name)}"
+           onerror="this.src='https://via.placeholder.com/400x300/1b1f24/ffffff?text=No+Image'">
+      <div class="meta">
+        <div class="title">${escapeHtml(p.product_name)}</div>
+        <div class="brand">${escapeHtml(p.brand||'')}</div>
+        <div class="price">₹${Number(toNum(p.price)).toLocaleString()}</div>
+        <div class="reason">${escapeHtml(reason)}</div>
+      </div>`;
+    recGrid.appendChild(card);
+  });
+}
+
+/* ---------- boot ---------- */
+(async function(){
+  try{
+    loader.style.display='block';
+
+    // read payload from index.html
+    const saved = JSON.parse(localStorage.getItem('recFilters')||'{}');
+    const selCategory = (saved.category||'').trim().toLowerCase();
+    const selBrand = (saved.brand||'').trim().toLowerCase();
+    const seeds = Array.isArray(saved.seeds) ? saved.seeds : [];
+
+    // show badges
+    if(selCategory) seedInfo.appendChild(badge(`Cat: ${selCategory}`));
+    if(selBrand)    seedInfo.appendChild(badge(`Brand: ${selBrand}`));
+    if(seeds.length){
+      const names = seeds.map(s=>s.product_name||'').filter(Boolean).slice(0,3).join(' • ');
+      seedInfo.appendChild(badge(`Seeds: ${names}${seeds.length>3?' …':''}`));
+    }
+
+    // load products
+    const resp = await fetch('products_with_images.csv');
+    if(!resp.ok) throw new Error('CSV load failed: '+resp.status);
+    const txt = await resp.text();
+    const all = parseAndCleanCSV(txt);
+
+    // same normalization as index
+    const norm = s=>String(s||'').trim().toLowerCase();
+    const firstCat = s=>{
+      if(!s) return '';
+      const raw=String(s);
+      if(raw.includes('>')) return raw.split('>')[0].trim();
+      if(raw.includes('/')) return raw.split('/')[0].trim();
+      return raw.trim();
+    };
+    function keyCategory(p){ return norm(firstCat(p.product_category_tree||p.category||p['product category']||p['category name']||p['category']||'')); }
+    function keyBrand(p){ return norm(p.brand||p.brand_name||p['brand name']||p.manufacturer||''); }
+
+    let pool = all.slice();
+    if(selCategory) pool = pool.filter(p=> keyCategory(p)===selCategory );
+    if(selBrand)    pool = pool.filter(p=> keyBrand(p)===selBrand );
+    if(!pool.length) pool = all.slice(0,200); // never blank
+
+    // initial rank
+    // initial rank
+    // initial rank (apply price filter too)
+    const lam0 = parseFloat(lambda2.value) || 0.8;
+    const k0   = Math.max(1, Math.min(50, parseInt(topk2.value) || 12));
+    const lo0  = parseFloat(minPInput.value);
+    const hi0  = parseFloat(maxPInput.value);
+
+    const pool0   = filterByPrice(pool, lo0, hi0);
+    const ranked0 = mmrRank(pool0, seeds, lam0, k0);
+    render(ranked0, seeds);
+
+    // re-rank handler
+    // re-rank handler (single source of truth)
+rerankBtn.addEventListener('click', () => {
+  const lam = parseFloat(lambda2.value) || 0.8;
+  const k   = Math.max(1, Math.min(50, parseInt(topk2.value) || 12));
+  const lo  = parseFloat(minPInput.value);
+  const hi  = parseFloat(maxPInput.value);
+
+  // price filter on the current category/brand pool
+  const priced = filterByPrice(pool, lo, hi);
+
+  const ranked = mmrRank(priced, seeds, lam, k);
+  render(ranked, seeds);
+});
+
+// make price & top-k fields live (trigger re-rank on change)
+[minPInput, maxPInput, topk2].forEach(el => {
+  if (el) el.addEventListener('input', () => rerankBtn.click());
+});
+
+
+  }catch(err){
+    console.error(err);
+    loader.textContent = 'Failed to load recommendations. See console.';
+  }
+})();
+
+function badge(text){ const b=document.createElement('div'); b.className='badge'; b.textContent=text; return b; }
+
+
+</script>
+</body>
+</html>

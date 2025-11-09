@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Flipkart-Style Recommender — Filter & Select</title>
+<style>
+:root {
+  --bg: #0b0d10; --card: #15171a; --accent: #2ea3ff;
+  --muted: #93a3b8; --text: #e6eef6;
+}
+body {
+  margin: 0; font-family: 'Inter', sans-serif;
+  background: var(--bg); color: var(--text);
+}
+header {
+  text-align: center; padding: 16px; border-bottom: 1px solid #111;
+}
+header h1 { margin: 0; font-size: 22px; }
+
+.filter-box {
+  background: var(--card); border-radius: 12px;
+  margin: 20px auto; padding: 16px;
+  width: 90%; max-width: 900px;
+  box-shadow: 0 0 10px rgba(0,0,0,0.4);
+}
+
+.filter-section {
+  display: flex; justify-content: space-between;
+  align-items: center; flex-wrap: wrap; gap: 10px;
+}
+
+.filter-group { position: relative; width: 45%; }
+.filter-group label { color: var(--muted); font-size: 14px; display: block; margin-bottom: 6px; }
+
+.dropdown {
+  background: var(--bg); border: 1px solid #2a2e33; border-radius: 8px;
+  padding: 10px; color: var(--text); cursor: pointer;
+}
+.dropdown:hover { border-color: var(--accent); }
+
+.dropdown-options {
+  display: none; position: absolute; top: 60px; left: 0;
+  background: var(--card); border: 1px solid #2a2e33;
+  border-radius: 8px; width: 100%; z-index: 10;
+  max-height: 200px; overflow-y: auto;
+}
+.dropdown-option {
+  padding: 10px; cursor: pointer; border-bottom: 1px solid #222;
+}
+.dropdown-option:hover { background: var(--accent); color: #02243a; }
+
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fill,minmax(200px,1fr));
+  gap: 12px; padding: 12px;
+}
+.card {
+  background: var(--card); border-radius: 10px; overflow: hidden;
+  border: 1px solid #111; cursor: pointer;
+  transition: transform .12s, outline .1s;
+}
+.card:hover { transform: translateY(-6px); }
+.card.selected { outline: 2px solid var(--accent); }
+img.card-img { width: 100%; height: 150px; object-fit: cover; background: #111; }
+.meta { padding: 10px; }
+.title { font-weight: 700; font-size: 14px; }
+.brand { color: var(--muted); font-size: 13px; }
+.price { color: var(--accent); font-weight: 800; }
+
+button {
+  display: block; margin: 20px auto; padding: 10px 20px;
+  background: var(--accent); color: #02243a; font-weight: 700;
+  border: none; border-radius: 8px; cursor: pointer;
+}
+button:hover { background: #3eb3ff; }
+
+#loader { text-align: center; color: var(--muted); padding: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🛒 E Commerce Recommender</h1>
+  <div style="color:var(--muted);font-size:13px;">Select filters & favorite products → Get recommendations</div>
+</header>
+
+<!-- New clean filter area (dropdowns built dynamically) -->
+<div class="filter-box">
+  <div class="filter-section">
+    <div class="filter-group">
+      <label for="categorySelect">Category</label>
+      <select id="categorySelect">
+        <option value="">All categories</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="brandSelect">Brand</label>
+      <select id="brandSelect">
+        <option value="">All brands</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+
+<div class="section-title" style="padding-left:20px;">Select Products You Like</div>
+<div id="loader">Loading products…</div>
+<div id="grid" class="grid"></div>
+
+<button id="recommendBtn">Recommend</button>
+<script>
+let products = [];
+let currentView = [];
+let selected = new Set();
+let selectedCategory = '';
+let selectedBrand = '';
+
+const catSelect = document.getElementById('categorySelect');
+const brandSelect = document.getElementById('brandSelect');
+const grid = document.getElementById('grid');
+const loader = document.getElementById('loader');
+
+// ---------- CSV LOAD ----------
+fetch('products_with_images.csv')
+  .then(r => {
+    if (!r.ok) throw new Error('Failed to fetch products_with_images.csv (' + r.status + ')');
+    return r.text();
+  })
+  .then(txt => {
+    products = parseAndCleanCSV(txt);
+    loader.style.display = 'none';
+    buildSelectOptions(products);            // populate <select>s
+    renderGrid(products.slice(0, 50));      // initial grid
+  })
+  .catch(err => {
+    loader.style.display = 'none';
+    console.error(err);
+    alert('Could not load products_with_images.csv (use Live Server and correct filename).');
+  });
+
+// ---------- CSV PARSER (robust & NO "Generic/Misc" defaults) ----------
+function parseAndCleanCSV(txt) {
+  const lines = txt.replace(/^\uFEFF/, '').split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = splitCols(lines.shift()).map(h => h.trim().toLowerCase());
+
+  const rows = lines.map(line => {
+    const cols = splitCols(line);
+    const o = {};
+    headers.forEach((h, i) => { o[h] = (cols[i] ?? '').trim(); });
+
+    // normalize common fields
+    o.product_name =
+      o.product_name || o['product name'] || o.title || o.name || o['product_title'] || 'Unnamed Product';
+
+    o.product_category_tree =
+      o.product_category_tree || o.category || o['product category'] || o['category name'] || o['category'] || '';
+
+    o.brand =
+      o.brand || o.brand_name || o['brand name'] || o.manufacturer || o['manufacturer'] || '';
+
+    // price
+    const p = (o.discounted_price || o.price || '').toString().replace(/[^\d.]/g, '');
+    o.price = isFinite(parseFloat(p)) ? parseFloat(p) : 0;
+
+    // image
+    let img = o.image || o.image_url || o['image url'] || '';
+    if (!/^https?:\/\//i.test(img)) {
+      img = `https://via.placeholder.com/400x300/1b1f24/ffffff?text=${encodeURIComponent((o.product_name||'Item').slice(0,40))}`;
+    }
+    o.image = img;
+
+    return o;
+  });
+  return rows;
+
+  // CSV-safe splitter (handles commas inside quotes)
+  function splitCols(line) {
+    const out = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; cur += ch; continue; }
+      if (ch === ',' && !inQ) { out.push(trimQuotes(cur)); cur = ''; continue; }
+      cur += ch;
+    }
+    out.push(trimQuotes(cur));
+    return out;
+  }
+  function trimQuotes(s) { return s.replace(/^"+|"+$/g, ''); }
+}
+
+// ---------- BUILD <select> OPTIONS ----------
+function buildSelectOptions(all) {
+  const normalize = s => String(s || '').trim().toLowerCase();
+  const firstCategory = s => {
+    if (!s) return '';
+    const raw = String(s);
+    if (raw.includes('>')) return raw.split('>')[0].trim();
+    if (raw.includes('/')) return raw.split('/')[0].trim();
+    return raw.trim();
+  };
+  const BAD = new Set(['', 'misc', 'miscellaneous', 'generic', 'unknown', 'na', 'n/a', 'other', '-']);
+
+  const catCount = new Map();
+  const brandCount = new Map();
+
+  for (const p of all) {
+    const ck = normalize(firstCategory(
+      p.product_category_tree || p.category || p['product category'] || p['category name'] || p['category'] || ''
+    ));
+    if (!BAD.has(ck)) catCount.set(ck, (catCount.get(ck) || 0) + 1);
+
+    const bk = normalize(
+      p.brand || p.brand_name || p['brand name'] || p.manufacturer || p['manufacturer'] || ''
+    );
+    if (!BAD.has(bk)) brandCount.set(bk, (brandCount.get(bk) || 0) + 1);
+  }
+
+  // Fill category <select>
+  catSelect.innerHTML = '<option value="">All categories</option>';
+  [...catCount.entries()].sort((a,b)=>b[1]-a[1]).slice(0,300).forEach(([key, cnt]) => {
+    const opt = document.createElement('option');
+    opt.value = key; opt.textContent = `${key} (${cnt})`;
+    catSelect.appendChild(opt);
+  });
+
+  // Fill brand <select>
+  brandSelect.innerHTML = '<option value="">All brands</option>';
+  [...brandCount.entries()].sort((a,b)=>b[1]-a[1]).slice(0,300).forEach(([key, cnt]) => {
+    const opt = document.createElement('option');
+    opt.value = key; opt.textContent = `${key} (${cnt})`;
+    brandSelect.appendChild(opt);
+  });
+
+  // Hook up change events
+  catSelect.onchange = () => { selectedCategory = catSelect.value; applyFilters(); };
+  brandSelect.onchange = () => { selectedBrand = brandSelect.value; applyFilters(); };
+}
+
+// ---------- FILTER + RENDER GRID ----------
+function keyCategory(p) {
+  const normalize = s => String(s || '').trim().toLowerCase();
+  const firstCategory = s => {
+    if (!s) return '';
+    const raw = String(s);
+    if (raw.includes('>')) return raw.split('>')[0].trim();
+    if (raw.includes('/')) return raw.split('/')[0].trim();
+    return raw.trim();
+  };
+  return normalize(firstCategory(
+    p.product_category_tree || p.category || p['product category'] || p['category name'] || p['category'] || ''
+  ));
+}
+function keyBrand(p) {
+  const normalize = s => String(s || '').trim().toLowerCase();
+  return normalize(
+    p.brand || p.brand_name || p['brand name'] || p.manufacturer || p['manufacturer'] || ''
+  );
+}
+
+function applyFilters() {
+  let list = products;
+  if (selectedCategory) list = list.filter(p => keyCategory(p) === selectedCategory);
+  if (selectedBrand)    list = list.filter(p => keyBrand(p) === selectedBrand);
+  renderGrid(list.slice(0, 50));
+}
+
+function renderGrid(list) {
+   currentView = list;
+  grid.innerHTML = '';
+  selected.clear();
+  list.forEach((p, idx) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <img class="card-img" src="${p.image}" alt="${escapeHtml(p.product_name)}" onerror="this.src='https://via.placeholder.com/400x300/1b1f24/ffffff?text=No+Image'">
+      <div class="meta">
+        <div class="title">${escapeHtml(p.product_name).slice(0, 80)}</div>
+        <div class="brand">${escapeHtml(p.brand)}</div>
+        <div class="price">₹${Number(p.price || 0).toLocaleString()}</div>
+      </div>`;
+    card.onclick = () => {
+      if (card.classList.contains('selected')) { card.classList.remove('selected'); selected.delete(idx); }
+      else { card.classList.add('selected'); selected.add(idx); }
+    };
+    grid.appendChild(card);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+
+document.getElementById('recommendBtn').onclick = () => {
+  // pack selected seed products (by value, not just indices)
+  const seeds = [...selected]
+    .map(i => currentView[i])
+    .filter(Boolean)
+    .map(p => ({
+      product_name: p.product_name || '',
+      brand: p.brand || '',
+      product_category_tree: p.product_category_tree || '',
+      description: p.description || '',
+      price: p.price || 0
+    }));
+
+  const data = {
+    category: selectedCategory,
+    brand: selectedBrand,
+    
+    seeds
+  };
+  localStorage.setItem('recFilters', JSON.stringify(data));
+  window.location.href = 'recommendations.html';
+};
+
+</script>
+
+
+
+
+</body>
+</html>
